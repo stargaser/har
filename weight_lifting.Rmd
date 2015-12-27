@@ -14,22 +14,24 @@ weightlifting exercises with good form and with poor form. The training set incl
 as several features that were simply identification information (like participant
 name and time the data were taken). We trained both a CART model and a random 
 forest model. The simple CART model reached only a 50% accuracy on the training set
-but the random forest model reached 99.5% accuracy on the same set. The random
+but the random forest model reached 99.4% accuracy on the same set. The random
 forest model predicted all 20 test cases correctly.
 
-## Data Input
+## Data Input and Preprocessing
 
-```{r, echo=FALSE, warning=FALSE}
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
 setwd('/Users/shupe/Documents/DataScienceJHU/RWork/machine_learning/project/')
 library(caret)
 library(randomForest)
+library(doMC)
+library(rpart)
 ```
 
 The training set was provided in 'pml-training.csv' and the test set in
 'pml-testing.csv'. After some iteration, we read in the values treating
 'NA', blank, or the Excel-ism '#DIV/0!' as missing values.
 
-```{r, echo=FALSE}
+```{r datainput}
 training <- read.csv('pml-training.csv', na.strings=c(" ","#DIV/0!","NA"))
 test <- read.csv('pml-testing.csv',na.strings=c(" ","#DIV/0!","NA"))
 training$classe <- as.factor(training$classe)
@@ -37,10 +39,6 @@ training$classe <- as.factor(training$classe)
 
 A summary of the training set shows many of the 160 columns are populated mostly
 with NAs.
-```{r}
-summary(training)
-```
-
 We remove the columns that have more than 1000 NAs. This reduces the number of
 columns from 160 to 60. Then we remove the first 7 columns. These contain
 identifying information such as an index, the name of the participant, timestamps
@@ -50,27 +48,32 @@ so our intuition is to remove these features, leaving us only with the
 "fitness tracker"-style measurements.
 
 
-```{r}
+```{r good_training}
 good_training <- training[,colSums(is.na(training)) < 1000]
 good_training <- good_training[,8:ncol(good_training)]
 na_count <- data.frame(sapply(good_training, function(y) sum(length(which(is.na(y))))))
-na_count
 ```
 
 We are left with no NA values, so we won't have to impute missing values
 in the pre-processing set.
 
-```{r}
-summary(good_training)
-```
-
 We apply centering and scaling to the training features. The preprocessing
 steps are saved for later application to the test set.
-```{r}
+```{r preprocess_train}
 trainX <- good_training[,names(good_training) != 'classe']
 preProcValues <- preProcess(trainX, method = c("center", "scale"))
 scaledTrain <- predict(preProcValues, trainX)
 scaledTrain$classe <- good_training$classe
+```
+
+We will hold out 20% of the training set for the purposes of computing
+out-of-sample error.
+
+```{r partition}
+set.seed(33833)
+inTrain <- createDataPartition(y=scaledTrain$classe, p=0.8, list=FALSE)
+finalTrain <- scaledTrain[inTrain,]
+heldOutTrain <- scaledTrain[-inTrain,]
 ```
 
 ## CART model
@@ -78,56 +81,84 @@ scaledTrain$classe <- good_training$classe
 First we fit a CART model. Following the caret tutorial by Max Kuhn,
 we use 10-fold cross-validation with 3 repeats.
 
-```{r}
+```{r fit_cart, cache=FALSE}
 cvCtrl <- trainControl(method = "repeatedcv", repeats = 3)
 set.seed(33833)
-rpartTune <- train(classe ~ ., method = "rpart", data=scaledTrain,
+rpartTune <- train(classe ~ ., method = "rpart", data=finalTrain,
                     trControl = cvCtrl)
-
 ```
 
 How did we do?
-```{r}
+```{r cart_results}
 rpartTune
 ```
 Wow, 50% accuracy is pretty lousy.
 
 What are the most important variables?
-```{r}
-varImp(rpartTune)
+```{r cart_features}
+cartImp <- varImp(rpartTune, scale=FALSE)
+plot(cartImp, top = 20)
 ```
 
-We can see that many variables are not used in the CART model. In some sense
+We can see that only 16 of the 52 features are used in the CART model. In some sense
 it is not digging deeply into the data, in terms of numbers of features used.
 
 ## Random forest model
 
 Given the richness of the dataset and the small number of classes to predict,
-a random forest model is likely to do an excellent job. Here again we use
-10-fold cross-validation with 3 repeats, as recommended by Max Kuhn in
-the caret tutorial.
+a random forest model is likely to do an excellent job. As this model is
+computationally intensive, we use 10-fold cross-validation with no repeats.
+Further, we parallelize the calculations using 6 cores. We will set seeds
+for the cross-validation since we're doing this in parallel.
 
-```{r, cache=TRUE}
+```{r fit_random_forest, cache=FALSE}
+registerDoMC(cores=6)
 set.seed(33833)
-cvCtrl <- trainControl(method = "repeatedcv", repeats = 3)
-rfFit <- train(classe ~ ., method="rf", data=scaledTrain,  
+seeds <- vector(mode = "list", length = 11)
+for(i in 1:10) seeds[[i]] <- sample.int(1000, 22)
+## For the last model:
+seeds[[11]] <- sample.int(1000, 1)
+cvCtrl <- trainControl(method = "cv", number=10, seeds=seeds)
+rfFit <- train(classe ~ ., method="rf", data=finalTrain,  
                trControl = cvCtrl)
 ```
+The model takes about 8 minutes to compute this way.
 
 How did we do?
-```{r}
+```{r rf_results}
 rfFit
 ```
 
-An accuracy of 99.5% is quite good!
+An accuracy of 99.4% is quite good! Kappa is 99.3%. 
+Our estimate of the out-of-sample error
+from cross-validation is therefore 0.7%. Strictly speaking, we should estimate
+the out-of-sample error on a sample that we didn't use for training at all.
+The test set that was provided contains only 20 samples though so won't give
+a precise estimate of out-of-sample error.
+
+How well does our random forest model fit the data we held out from training?
+```{r rf_confusion_matrix}
+set.seed(33833)
+predTraining <- predict(rfFit,newdata=heldOutTrain)
+confusionMatrix(predTraining, heldOutTrain$classe)
+```
+We see that the random forest model classifies with 99.5% accuracy over all
+classes, with a Kappa of 99.4%.
+So our out-of-sample error is about 0.6% in good agreement with the results
+of cross-validation. 
+
+An interesting side note is the No Information Rate of 28.47%. This means that
+if I guessed the class randomly, I'd get it right about 28% of the time. Our
+random forest classifier does much better than that.
 
 What are the most important variables?
-```{r}
-varImp(rfFit)
+```{r rf_features}
+rfImp <- varImp(rfFit, scale=FALSE)
+plot(rfImp, top = 20)
 ```
 
 We can see that many more features are used by the random forest model than
-by the CART model.
+by the CART model. In fact, the random forest model uses all 52 features provided.
 
 ## Applying the random forest model to the test set
 
@@ -136,16 +167,15 @@ is first necessary to apply the same preprocessing to the test set that
 was done to the training set. We remove the "NA" columns and the first
 7 columns with number, name, timestamp and window information.
 
-```{r}
+```{r trim_test}
 good_test <- test[,colSums(is.na(training)) ==0]
-ncol(good_test)
 good_test <- good_test[,8:ncol(good_test)]
 ```
 
 We remove the "problem_id" column, apply the centering and scaling
 preprocessing done for the training set, and add back the "problem_id" column.
 
-```{r}
+```{r preprocess_test}
 testX <- good_test[,names(good_test) != 'problem_id']
 scaledTest <- predict(preProcValues, testX)
 scaledTest$problem_id <- good_test$problem_id
@@ -153,7 +183,7 @@ scaledTest$problem_id <- good_test$problem_id
 
 Now we are ready to apply our model to the test set.
 
-```{r}
+```{r test_predict}
 predTest <- predict(rfFit,newdata=scaledTest)
 answers <- as.character(predTest)
 ```
@@ -163,7 +193,7 @@ answers <- as.character(predTest)
 Following the instructions in the assignment, we write text files for each
 answer for submission to the online automatic grader.
 
-```{r, echo=FALSE}
+```{r write_answers, echo=FALSE}
 pml_write_files = function(x){
   n = length(x)
   for(i in 1:n){
